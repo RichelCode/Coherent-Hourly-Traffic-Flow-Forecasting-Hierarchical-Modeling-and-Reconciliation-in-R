@@ -1,0 +1,289 @@
+---
+title: "Final Project - STA 652"
+author: "Richel Attafuah"
+date: "2026-03-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Coherent Hourly Traffic Flow Forecasting: Hierarchical Modeling and Reconciliation in R
+
+## Reproducible workflow and leakage control
+
+This project is implemented entirely in R using the `fpp3` ecosystem. The workflow is designed to be methodologically rigorous and reproducible.
+A central design principle is the prevention of data leakage. The data are split into training and test periods before any imputation used for model fitting is performed. Missing values in the training set are imputed using summaries computed from the training data only. The test target values are never imputed. Instead, the evaluation sample is restricted to stations with fully observed test outcomes so that holdout accuracy is measured against genuine observed traffic counts.
+
+To keep the analysis modular and reproducible, I define a small set of helper functions for hierarchy labeling, accuracy summarization, model fitting, and leakage-safe split preparation.
+
+```{r include=FALSE}
+############################################################
+# 0. Setup and helper functions
+############################################################
+
+install.packages(c("fpp3", "lubridate", "patchwork"))
+
+library(fpp3)
+library(lubridate)
+library(patchwork)
+
+# ---------------------------
+# Project paths
+# ---------------------------
+# Recommended repository structure:
+# coherent-traffic-forecasting-r/
+#   data/cleaned_traffic_data.csv
+#   scripts/
+#   outputs/
+#   report/
+
+data_path <- "data/cleaned_traffic_data.csv"
+
+# ---------------------------
+# Accuracy measures used throughout
+# ---------------------------
+accuracy_measures <- list(
+  RMSE  = RMSE,
+  MAE   = MAE,
+  MASE  = MASE,
+  RMSSE = RMSSE
+)
+
+# ---------------------------
+# Helper: add hierarchy level labels
+# ---------------------------
+add_hierarchy_level <- function(x) {
+  x |>
+    mutate(
+      hierarchy_level = case_when(
+        is_aggregated(route) &
+          is_aggregated(direction) &
+          is_aggregated(lane_type) &
+          is_aggregated(station) ~ "Total",
+
+        !is_aggregated(route) &
+          is_aggregated(direction) &
+          is_aggregated(lane_type) &
+          is_aggregated(station) ~ "Route",
+
+        !is_aggregated(route) &
+          !is_aggregated(direction) &
+          is_aggregated(lane_type) &
+          is_aggregated(station) ~ "Route-Direction",
+
+        !is_aggregated(route) &
+          !is_aggregated(direction) &
+          !is_aggregated(lane_type) &
+          is_aggregated(station) ~ "Route-Direction-LaneType",
+
+        !is_aggregated(route) &
+          !is_aggregated(direction) &
+          !is_aggregated(lane_type) &
+          !is_aggregated(station) ~ "Station",
+
+        TRUE ~ "Other"
+      )
+    )
+}
+
+# ---------------------------
+# Helper: summarise accuracy by hierarchy level
+# ---------------------------
+summarise_accuracy_by_level <- function(acc_tbl) {
+  acc_tbl |>
+    add_hierarchy_level() |>
+    group_by(.model, hierarchy_level) |>
+    summarise(
+      RMSE  = mean(RMSE, na.rm = TRUE),
+      MAE   = mean(MAE, na.rm = TRUE),
+      MASE  = mean(MASE, na.rm = TRUE),
+      RMSSE = mean(RMSSE, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(hierarchy_level, RMSSE)
+}
+
+# ---------------------------
+# Helper: fit base models
+# ---------------------------
+fit_base_suite <- function(train_hier) {
+  train_hier |>
+    model(
+      ets   = ETS(flow),
+      arima = ARIMA(flow)
+    )
+}
+
+# ---------------------------
+# Helper: fit reconciliation suite
+# ---------------------------
+fit_reconciliation_suite <- function(base_models) {
+  base_models |>
+    reconcile(
+      ets_bu            = bottom_up(ets),
+      ets_td_forecast   = top_down(ets, method = "forecast_proportions"),
+      ets_td_historical = top_down(ets, method = "average_proportions"),
+      ets_mint_shrink   = min_trace(ets, method = "mint_shrink"),
+      ets_mint_sample   = min_trace(ets, method = "mint_cov"),
+
+      arima_bu            = bottom_up(arima),
+      arima_td_forecast   = top_down(arima, method = "forecast_proportions"),
+      arima_td_historical = top_down(arima, method = "average_proportions"),
+      arima_mint_shrink   = min_trace(arima, method = "mint_shrink"),
+      arima_mint_sample   = min_trace(arima, method = "mint_cov")
+    )
+}
+
+# ---------------------------
+# Helper: leakage-safe split preparation
+# ---------------------------
+# This function:
+# 1. splits the balanced bottom-level panel into train/test,
+# 2. computes imputation references using TRAIN ONLY,
+# 3. imputes TRAIN ONLY,
+# 4. leaves TEST actuals untouched,
+# 5. returns hierarchical train/test tsibbles.
+prepare_hier_split <- function(panel_data, cutoff_time) {
+
+  train_raw <- panel_data |>
+    filter(timestamp <= cutoff_time) |>
+    mutate(
+      day_of_week  = wday(timestamp, week_start = 1),
+      hour_of_day  = hour(timestamp),
+      hour_of_week = (day_of_week - 1L) * 24L + hour_of_day
+    )
+
+  test_raw <- panel_data |>
+    filter(timestamp > cutoff_time)
+
+  observed_train <- train_raw |>
+    filter(!is.na(total_flow))
+
+  if (nrow(observed_train) == 0) {
+    stop("No observed training values are available after filtering.")
+  }
+
+  # Training-only imputation references
+  ref_station_hw <- observed_train |>
+    group_by(station, hour_of_week) |>
+    summarise(ref_station_hw = median(total_flow), .groups = "drop")
+
+  ref_station <- observed_train |>
+    group_by(station) |>
+    summarise(ref_station = median(total_flow), .groups = "drop")
+
+  ref_cell_hw <- observed_train |>
+    group_by(route, direction, lane_type, hour_of_week) |>
+    summarise(ref_cell_hw = median(total_flow), .groups = "drop")
+
+  ref_cell <- observed_train |>
+    group_by(route, direction, lane_type) |>
+    summarise(ref_cell = median(total_flow), .groups = "drop")
+
+  ref_global_hw <- observed_train |>
+    group_by(hour_of_week) |>
+    summarise(ref_global_hw = median(total_flow), .groups = "drop")
+
+  ref_global <- median(observed_train$total_flow, na.rm = TRUE)
+
+  # Impute TRAIN ONLY using training-derived references
+  train_imputed <- train_raw |>
+    left_join(ref_station_hw, by = c("station", "hour_of_week")) |>
+    left_join(ref_station, by = "station") |>
+    left_join(ref_cell_hw, by = c("route", "direction", "lane_type", "hour_of_week")) |>
+    left_join(ref_cell, by = c("route", "direction", "lane_type")) |>
+    left_join(ref_global_hw, by = "hour_of_week") |>
+    mutate(
+      flow = case_when(
+        !is.na(total_flow) ~ total_flow,
+        is.na(total_flow) & !is.na(ref_station_hw) ~ ref_station_hw,
+        is.na(total_flow) & !is.na(ref_station) ~ ref_station,
+        is.na(total_flow) & !is.na(ref_cell_hw) ~ ref_cell_hw,
+        is.na(total_flow) & !is.na(ref_cell) ~ ref_cell,
+        is.na(total_flow) & !is.na(ref_global_hw) ~ ref_global_hw,
+        TRUE ~ ref_global
+      )
+    ) |>
+    select(timestamp, station, route, direction, lane_type, flow)
+
+  if (any(is.na(train_imputed$flow))) {
+    stop("Training imputation produced NA values. Check the reference cascade.")
+  }
+
+  # Never impute the test target
+  if (any(is.na(test_raw$total_flow))) {
+    stop("Test set contains missing actuals. Revise the station screen so evaluation remains fully observed.")
+  }
+
+  test_actuals <- test_raw |>
+    transmute(
+      timestamp,
+      station,
+      route,
+      direction,
+      lane_type,
+      flow = total_flow
+    )
+
+  train_bottom <- train_imputed |>
+    as_tsibble(key = c(route, direction, lane_type, station), index = timestamp)
+
+  test_bottom <- test_actuals |>
+    as_tsibble(key = c(route, direction, lane_type, station), index = timestamp)
+
+  train_hier <- train_bottom |>
+    aggregate_key(
+      route / direction / lane_type / station,
+      flow = sum(flow)
+    )
+
+  test_hier <- test_bottom |>
+    aggregate_key(
+      route / direction / lane_type / station,
+      flow = sum(flow)
+    )
+
+  list(
+    train_bottom = train_bottom,
+    test_bottom  = test_bottom,
+    train_hier   = train_hier,
+    test_hier    = test_hier
+  )
+}
+```
+
+
+# 1. Problem formulation and hierarchy definition
+
+## 1.1 Forecasting objective
+
+This project studies hierarchical time series forecasting and forecast reconciliation using hourly traffic flow data. The forecasting problem is inherently multilevel: station-level flows aggregate to route-direction-lane-type totals, which aggregate further to route-direction totals, then to route totals, and ultimately to the system total. If forecasts are generated independently at each level, they will generally be incoherent, meaning that lower-level forecasts will not sum exactly to higher-level forecasts.
+
+The aim of the project is therefore to compare alternative reconciliation strategies that transform independently generated base forecasts into a coherent forecasting system.
+
+## 1.2 Why this dataset is suitable
+
+The dataset contains regularly spaced hourly observations and a large number of bottom-level traffic stations. The core structural variables are `Route`, `Direction of Travel`, `Lane Type`, and `Station`. These fields support a clear additive hierarchy. The `District` field is not used in the hierarchy because it does not provide meaningful variation in the uploaded extract.
+
+## 1.3 Main hierarchy
+
+The main hierarchy used in this project is:
+
+\[
+\text{Total}
+\rightarrow
+\text{Route}
+\rightarrow
+\text{Route-Direction}
+\rightarrow
+\text{Route-Direction-Lane Type}
+\rightarrow
+\text{Station}.
+\]
+
+This design satisfies the assignment requirement of having at least three hierarchical levels and provides a natural operational interpretation for traffic forecasting.
+
+
+
