@@ -286,4 +286,309 @@ The main hierarchy used in this project is:
 This design satisfies the assignment requirement of having at least three hierarchical levels and provides a natural operational interpretation for traffic forecasting.
 
 
+```{r echo=FALSE}
+############################################################
+# Problem formulation and data audit
+############################################################
+
+traffic_raw <- readr::read_csv("C:\\Users\\attafuro\\Desktop\\EV Charging Analysis\\STA 652 Project\\cleaned_traffic_data.csv", show_col_types = FALSE) |>
+  transmute(
+    timestamp = parse_date_time(
+      Timestamp,
+      orders = c("mdy HM", "mdy HMS"),
+      tz = "UTC"
+    ),
+    station        = as.character(Station),
+    district       = as.character(District),
+    route          = as.character(Route),
+    direction      = as.character(`Direction of Travel`),
+    lane_type      = as.character(`Lane Type`),
+    station_length = as.numeric(`Station Length`),
+    samples        = as.numeric(Samples),
+    pct_observed   = as.numeric(`% Observed`),
+    total_flow     = as.numeric(`Total Flow`)
+  ) |>
+  arrange(station, timestamp)
+
+# High-level data profile
+data_profile <- traffic_raw |>
+  summarise(
+    n_rows        = n(),
+    n_timestamps  = n_distinct(timestamp),
+    n_stations    = n_distinct(station),
+    n_routes      = n_distinct(route),
+    n_directions  = n_distinct(direction),
+    n_lane_types  = n_distinct(lane_type),
+    n_districts   = n_distinct(district),
+    min_time      = min(timestamp, na.rm = TRUE),
+    max_time      = max(timestamp, na.rm = TRUE)
+  )
+
+print(data_profile)
+
+# Check whether station metadata are structurally consistent
+station_mapping_check <- traffic_raw |>
+  group_by(station) |>
+  summarise(
+    n_routes     = n_distinct(route),
+    n_directions = n_distinct(direction),
+    n_lane_types = n_distinct(lane_type),
+    .groups = "drop"
+  )
+
+stopifnot(
+  max(station_mapping_check$n_routes) == 1,
+  max(station_mapping_check$n_directions) == 1,
+  max(station_mapping_check$n_lane_types) == 1
+)
+
+# Check duplicate station-time observations
+duplicate_check <- traffic_raw |>
+  count(station, timestamp, name = "n") |>
+  filter(n > 1)
+
+stopifnot(nrow(duplicate_check) == 0)
+
+# Keep one clean station metadata table
+station_meta <- traffic_raw |>
+  distinct(station, route, direction, lane_type)
+```
+
+
+# 2. Leakage-safe sample construction
+
+## 2.1 Why the split comes before imputation
+
+To avoid leakage, the forecasting origin is defined before any training imputation is carried out. This means that any missing values used for model fitting are imputed using only information available within the training period. The test target values are never imputed.
+
+This choice is important because using the full sample to estimate imputation templates would allow future information to influence model training. That would bias forecast evaluation.
+
+## 2.2 Balanced panel construction
+
+The raw file may contain implicit gaps, where a station-hour combination is absent rather than explicitly recorded as missing. To make the forecasting panel well defined, I first construct the full station-by-hour grid and then join the raw observations back onto that grid. This makes all missingness explicit.
+
+## 2.3 Station screening
+
+The final evaluation sample is selected using the following rules:
+
+1. the station must be present for the full hourly training and test index,
+2. the station must have no missing test target values,
+3. the training missingness rate must be low.
+
+The second rule is used only to guarantee a valid holdout evaluation sample. It does not provide the model with future target values, and the test outcomes themselves remain untouched.
+
+```{r echo=FALSE}
+############################################################
+#  Leakage-safe sample construction and train/test split
+############################################################
+
+# Build a balanced station-by-hour panel so that implicit gaps become explicit
+all_timestamps <- traffic_raw |>
+  distinct(timestamp) |>
+  arrange(timestamp)
+
+traffic_panel <- station_meta |>
+  tidyr::crossing(timestamp = all_timestamps$timestamp) |>
+  left_join(
+    traffic_raw |>
+      select(timestamp, station, route, direction, lane_type, pct_observed, total_flow),
+    by = c("timestamp", "station", "route", "direction", "lane_type")
+  ) |>
+  arrange(station, timestamp)
+
+# Main holdout horizon: last 14 days = 336 hours
+h_test <- 24 * 14
+cutoff_time <- max(traffic_panel$timestamp) - hours(h_test)
+
+n_train_times <- traffic_panel |>
+  filter(timestamp <= cutoff_time) |>
+  distinct(timestamp) |>
+  nrow()
+
+n_test_times <- traffic_panel |>
+  filter(timestamp > cutoff_time) |>
+  distinct(timestamp) |>
+  nrow()
+
+# Screen stations for a leakage-safe analysis sample
+station_screen <- traffic_panel |>
+  mutate(segment = if_else(timestamp <= cutoff_time, "train", "test")) |>
+  group_by(station, route, direction, lane_type, segment) |>
+  summarise(
+    n_rows             = n(),
+    missing_flow_n     = sum(is.na(total_flow)),
+    missing_flow_share = mean(is.na(total_flow)),
+    mean_pct_observed  = mean(pct_observed, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  pivot_wider(
+    names_from = segment,
+    values_from = c(n_rows, missing_flow_n, missing_flow_share, mean_pct_observed),
+    names_sep = "_"
+  )
+
+study_stations <- station_screen |>
+  filter(
+    n_rows_train == n_train_times,
+    n_rows_test == n_test_times,
+    missing_flow_n_test == 0,
+    missing_flow_share_train <= 0.05
+  ) |>
+  select(station, route, direction, lane_type)
+
+# Assignment requires at least 100 bottom-level series
+stopifnot(nrow(study_stations) >= 100)
+
+traffic_study <- traffic_panel |>
+  semi_join(study_stations, by = c("station", "route", "direction", "lane_type"))
+
+analysis_sample_summary <- traffic_study |>
+  summarise(
+    bottom_series = n_distinct(station),
+    timestamps    = n_distinct(timestamp),
+    routes        = n_distinct(route),
+    directions    = n_distinct(direction),
+    lane_types    = n_distinct(lane_type)
+  )
+
+print(analysis_sample_summary)
+```
+
+# 3. Balanced bottom-level panel and hierarchy construction
+
+## 3.1 Training-only imputation
+
+Any missing training values are imputed using a cascade of training-only reference summaries:
+
+1. station × hour-of-week median,
+2. station median,
+3. route-direction-lane-type × hour-of-week median,
+4. route-direction-lane-type median,
+5. global hour-of-week median,
+6. global median.
+
+This is intentionally conservative. The goal is not to create synthetic signal, but to repair a small number of training gaps while preserving recurring intraday and intraweek structure.
+
+## 3.2 Why the test set is not imputed
+
+The test set is reserved for genuine out-of-sample evaluation. Imputing test target values would contaminate the accuracy assessment. Therefore, the evaluation sample is restricted to stations with fully observed test outcomes.
+
+## 3.3 Hierarchical representation
+
+Let \(\mathbf{b}_t\) denote the vector of bottom-level station flows and let \(\mathbf{y}_t\) denote the full vector of all series in the hierarchy. Then
+
+\[
+\mathbf{y}_t = \mathbf{S}\mathbf{b}_t,
+\]
+
+where \(\mathbf{S}\) is the summing matrix. Each row of \(\mathbf{S}\) corresponds to either an aggregate series or a bottom-level series, and the matrix encodes the additive structure of the hierarchy.
+
+
+```{r echo=FALSE}
+############################################################
+# Training-only imputation and hierarchy construction
+############################################################
+
+main_split <- prepare_hier_split(
+  panel_data  = traffic_study,
+  cutoff_time = cutoff_time
+)
+
+train_bottom <- main_split$train_bottom
+test_bottom  <- main_split$test_bottom
+train_hier   <- main_split$train_hier
+test_hier    <- main_split$test_hier
+
+# Forecast horizon implied by the holdout
+h_main <- test_hier |>
+  distinct(timestamp) |>
+  nrow()
+
+# Quick structural summary
+hierarchy_sample_summary <- tibble(
+  bottom_series = n_distinct(train_bottom$station),
+  train_hours   = n_distinct(train_bottom$timestamp),
+  test_hours    = n_distinct(test_bottom$timestamp),
+  routes        = n_distinct(train_bottom$route),
+  directions    = n_distinct(train_bottom$direction),
+  lane_types    = n_distinct(train_bottom$lane_type)
+)
+
+print(hierarchy_sample_summary)
+```
+
+
+# Exploratory analysis
+
+All exploratory analysis shown below is based on the training period only. This keeps the descriptive work consistent with the leakage-control strategy and avoids using the holdout data to inform modeling decisions.
+
+At the aggregate level, I examine the top-level series to assess overall trend, variability, and seasonality. I also inspect average hourly and day-of-week profiles to determine whether the traffic system exhibits strong intraday and intraweek structure. These diagnostics help justify the use of standard univariate forecasting models such as ETS and ARIMA.
+
+
+```{r echo=FALSE}
+############################################################
+#  Exploratory analysis using training data only
+############################################################
+
+# Top-level total series
+train_total <- train_hier |>
+  filter(
+    is_aggregated(route),
+    is_aggregated(direction),
+    is_aggregated(lane_type),
+    is_aggregated(station)
+  )
+
+test_total <- test_hier |>
+  filter(
+    is_aggregated(route),
+    is_aggregated(direction),
+    is_aggregated(lane_type),
+    is_aggregated(station)
+  )
+
+p_total <- bind_rows(train_total, test_total) |>
+  autoplot(flow) +
+  geom_vline(xintercept = cutoff_time, linetype = "dashed") +
+  labs(
+    title = "Top-level hourly traffic flow",
+    subtitle = "Dashed line marks the forecast origin",
+    x = "Time",
+    y = "Flow"
+  )
+
+# Mean hourly profile from TRAIN only
+hour_profile <- train_bottom |>
+  as_tibble() |>
+  mutate(hour = hour(timestamp)) |>
+  group_by(hour) |>
+  summarise(mean_flow = mean(flow), .groups = "drop")
+
+p_hour <- hour_profile |>
+  ggplot(aes(x = hour, y = mean_flow)) +
+  geom_line() +
+  labs(
+    title = "Mean hourly traffic profile (training data)",
+    x = "Hour of day",
+    y = "Mean flow"
+  )
+
+# Mean day-of-week profile from TRAIN only
+dow_profile <- train_bottom |>
+  as_tibble() |>
+  mutate(day = wday(timestamp, label = TRUE, week_start = 1)) |>
+  group_by(day) |>
+  summarise(mean_flow = mean(flow), .groups = "drop")
+
+p_dow <- dow_profile |>
+  ggplot(aes(x = day, y = mean_flow, group = 1)) +
+  geom_line() +
+  labs(
+    title = "Mean day-of-week traffic profile (training data)",
+    x = "Day of week",
+    y = "Mean flow"
+  )
+
+p_total / (p_hour | p_dow)
+```
 
