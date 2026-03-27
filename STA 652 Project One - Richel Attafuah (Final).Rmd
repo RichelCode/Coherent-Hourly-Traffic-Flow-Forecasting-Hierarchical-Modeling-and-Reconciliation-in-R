@@ -1,0 +1,893 @@
+---
+title: "STA 652 Project One - Richel Attafuah"
+author: "Richel Attafuah"
+date: "2026-03-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Coherent Hourly Traffic Flow Forecasting: A Reduced-Scale Hierarchical Reconciliation Study in R
+
+## Study design
+
+To make the project computationally feasible while preserving academic rigor, I use a reduced but structurally rich subset of the original traffic dataset.
+
+The analysis uses only **November 2024**, which provides 720 hourly observations per series. I then restrict the study sample to stations with complete observations for the full month and select up to three stations within each `Route × Direction × Lane Type` cell. This produces a deterministic and reproducible subset that preserves the diversity of the hierarchy while keeping model estimation manageable.
+
+This design remains appropriate for hierarchical forecasting because:
+
+1. the data are still regularly spaced,
+2. the bottom level still contains more than 100 series,
+3. each bottom-level series has far more than 100 time points,
+4. the additive aggregation structure is preserved,
+5. the data continue to support both a strict hierarchy and a grouped/cross-classified interpretation.
+
+A major benefit of this reduced design is that no imputation is required. By using only complete November stations, the analysis avoids one of the main sources of leakage risk in time series workflows.
+
+```{r include=FALSE,message=FALSE,warning=FALSE}
+############################################################
+#  Project setup
+############################################################
+
+library(fpp3)
+library(lubridate)
+library(patchwork)
+
+data_path <- "C:\\Users\\attafuro\\Desktop\\EV Charging Analysis\\cleaned_traffic_data.csv"
+
+accuracy_measures <- list(
+  RMSE  = RMSE,
+  MAE   = MAE,
+  MASE  = MASE,
+  RMSSE = RMSSE
+)
+
+add_hierarchy_level <- function(x) {
+  x |>
+    mutate(
+      hierarchy_level = case_when(
+        is_aggregated(route) &
+          is_aggregated(direction) &
+          is_aggregated(lane_type) &
+          is_aggregated(station) ~ "Total",
+
+        !is_aggregated(route) &
+          is_aggregated(direction) &
+          is_aggregated(lane_type) &
+          is_aggregated(station) ~ "Route",
+
+        !is_aggregated(route) &
+          !is_aggregated(direction) &
+          is_aggregated(lane_type) &
+          is_aggregated(station) ~ "Route-Direction",
+
+        !is_aggregated(route) &
+          !is_aggregated(direction) &
+          !is_aggregated(lane_type) &
+          is_aggregated(station) ~ "Route-Direction-LaneType",
+
+        !is_aggregated(route) &
+          !is_aggregated(direction) &
+          !is_aggregated(lane_type) &
+          !is_aggregated(station) ~ "Station",
+
+        TRUE ~ "Other"
+      )
+    )
+}
+
+summarise_accuracy_by_level <- function(acc_tbl) {
+  acc_tbl |>
+    add_hierarchy_level() |>
+    group_by(.model, hierarchy_level) |>
+    summarise(
+      RMSE  = mean(RMSE, na.rm = TRUE),
+      MAE   = mean(MAE, na.rm = TRUE),
+      MASE  = mean(MASE, na.rm = TRUE),
+      RMSSE = mean(RMSSE, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(hierarchy_level, RMSSE)
+}
+```
+
+# 1. Problem formulation and hierarchy definition
+
+## 1.1 Forecasting problem
+
+This project studies hierarchical time series forecasting and forecast reconciliation using hourly traffic flow data. The forecasting problem is multilevel because station-level traffic counts aggregate naturally to route-direction-lane-type totals, then to route-direction totals, then to route totals, and finally to the overall system total. Forecasts generated independently at these different levels will generally be incoherent, meaning that lower-level forecasts will not sum exactly to upper-level forecasts.
+
+The objective of this project is therefore to generate base forecasts for each series and then apply reconciliation methods that enforce coherence across the hierarchy.
+
+## 1.2 Reduced-scale project design
+
+To make the analysis computationally feasible, I use only one month of the data: **November 2024**. This month contains 720 hourly observations, which is still more than sufficient for the assignment requirement of at least 100 time points per series.
+
+I further reduce the bottom-level sample in a structured way. First, I keep only stations with complete November observations. Second, within each `Route × Direction × Lane Type` cell, I retain up to three stations, chosen deterministically by station identifier. This produces a manageable subset while preserving broad hierarchical coverage.
+
+Importantly, this station-selection rule is structural and reproducible. It is not based on forecast accuracy, target means, or any other target-driven criterion.
+
+## 1.3 Main hierarchy
+
+The main hierarchy used in the project is:
+
+\[
+\text{Total}
+\rightarrow
+\text{Route}
+\rightarrow
+\text{Route-Direction}
+\rightarrow
+\text{Route-Direction-Lane Type}
+\rightarrow
+\text{Station}.
+\]
+
+This structure is additive, interpretable, and supports all of the required reconciliation methods in the main analysis.
+
+```{r echo=FALSE}
+
+############################################################
+# Problem formulation and reduced-sample definition
+############################################################
+
+traffic_raw <- readr::read_csv(data_path, show_col_types = FALSE) |>
+  transmute(
+    timestamp = mdy_hms(Timestamp, tz = "UTC"),
+    station   = as.character(Station),
+    route     = as.character(Route),
+    direction = as.character(`Direction of Travel`),
+    lane_type = as.character(`Lane Type`),
+    total_flow = as.numeric(`Total Flow`)
+  ) |>
+  arrange(station, timestamp)
+
+# Keep November 2024 only
+traffic_nov <- traffic_raw |>
+  filter(
+    year(timestamp) == 2024,
+    month(timestamp) == 11
+  )
+
+# Basic November profile
+nov_profile <- traffic_nov |>
+  summarise(
+    n_rows       = n(),
+    n_timestamps = n_distinct(timestamp),
+    n_stations   = n_distinct(station),
+    n_routes     = n_distinct(route),
+    n_directions = n_distinct(direction),
+    n_lane_types = n_distinct(lane_type),
+    min_time     = min(timestamp),
+    max_time     = max(timestamp)
+  )
+
+print(nov_profile)
+
+# Check station metadata consistency
+station_mapping_check <- traffic_nov |>
+  group_by(station) |>
+  summarise(
+    n_routes     = n_distinct(route),
+    n_directions = n_distinct(direction),
+    n_lane_types = n_distinct(lane_type),
+    .groups = "drop"
+  )
+
+stopifnot(
+  max(station_mapping_check$n_routes) == 1,
+  max(station_mapping_check$n_directions) == 1,
+  max(station_mapping_check$n_lane_types) == 1
+)
+
+# Identify complete November stations
+expected_hours <- traffic_nov |>
+  distinct(timestamp) |>
+  nrow()
+
+nov_station_quality <- traffic_nov |>
+  group_by(station, route, direction, lane_type) |>
+  summarise(
+    n_hours       = n(),
+    missing_flow  = sum(is.na(total_flow)),
+    .groups = "drop"
+  )
+
+complete_stations <- nov_station_quality |>
+  filter(
+    n_hours == expected_hours,
+    missing_flow == 0
+  ) |>
+  mutate(station_num = suppressWarnings(as.numeric(station))) |>
+  arrange(route, direction, lane_type, station_num, station)
+
+# Deterministic reduced sample:
+# keep up to 3 complete stations per Route x Direction x Lane Type cell
+selected_stations <- complete_stations |>
+  group_by(route, direction, lane_type) |>
+  slice_head(n = 3) |>
+  ungroup() |>
+  select(station, route, direction, lane_type)
+
+traffic_study <- traffic_nov |>
+  semi_join(selected_stations, by = c("station", "route", "direction", "lane_type")) |>
+  transmute(
+    timestamp,
+    station,
+    route,
+    direction,
+    lane_type,
+    flow = total_flow
+  ) |>
+  arrange(route, direction, lane_type, station, timestamp)
+
+# Verify the reduced sample has no missing values
+stopifnot(!any(is.na(traffic_study$flow)))
+
+study_sample_summary <- tibble(
+  bottom_series = n_distinct(traffic_study$station),
+  timestamps = n_distinct(traffic_study$timestamp),
+  routes = n_distinct(traffic_study$route),
+  route_direction = traffic_study |>
+    distinct(route, direction) |>
+    nrow(),
+  route_direction_lanetype = traffic_study |>
+    distinct(route, direction, lane_type) |>
+    nrow(),
+  rows_bottom = nrow(traffic_study)
+)
+
+print(study_sample_summary)
+
+# Assignment check: at least 100 bottom-level series
+stopifnot(n_distinct(traffic_study$station) >= 100)
+
+```
+
+
+# 2. Time-ordered split and aggregation structure
+
+## 2.1 Chronological splitting
+
+Because this is a time series problem, the data are split chronologically. The training period contains the earlier observations, and the test period contains the later observations. No random split is used.
+
+I reserve the final **7 days** of November as the holdout period. This yields a test horizon of 168 hours and preserves a full weekly cycle for evaluation. The training period consists of the earlier 23 days.
+
+This split respects the temporal ordering of the forecasting problem:
+
+- training data are in the past,
+- test data are in the future.
+
+## 2.2 Why no imputation is needed
+
+Unlike the earlier full-scale version, this reduced analysis uses only complete stations. Therefore, there are no missing target values in either the training or test periods, and no imputation is required.
+
+## 2.3 Aggregation matrix \(S\)
+
+Let \(\mathbf{b}_t\) denote the vector of bottom-level station flows at time \(t\), and let \(\mathbf{y}_t\) denote the vector of all series in the hierarchy. Then the hierarchy can be written as
+
+\[
+\mathbf{y}_t = \mathbf{S}\mathbf{b}_t,
+\]
+
+where \(\mathbf{S}\) is the summing matrix. Each aggregate series is a linear sum of the appropriate bottom-level station series.
+
+
+```{r echo=FALSE}
+############################################################
+#  Time-ordered train/test split and hierarchy construction
+############################################################
+
+# Bottom-level tsibble
+traffic_bottom <- traffic_study |>
+  as_tsibble(
+    key = c(route, direction, lane_type, station),
+    index = timestamp
+  )
+
+# Chronological split:
+# train = Nov 1 through Nov 23 23:00
+# test  = Nov 24 through Nov 30 23:00
+cutoff_time <- ymd_hms("2024-11-23 23:00:00", tz = "UTC")
+
+train_bottom <- traffic_bottom |>
+  filter(timestamp <= cutoff_time)
+
+test_bottom <- traffic_bottom |>
+  filter(timestamp > cutoff_time)
+
+h_test <- test_bottom |>
+  distinct(timestamp) |>
+  nrow()
+
+split_summary <- tibble(
+  train_hours = train_bottom |> distinct(timestamp) |> nrow(),
+  test_hours  = test_bottom  |> distinct(timestamp) |> nrow(),
+  train_start = min(train_bottom$timestamp),
+  train_end   = max(train_bottom$timestamp),
+  test_start  = min(test_bottom$timestamp),
+  test_end    = max(test_bottom$timestamp)
+)
+
+print(split_summary)
+
+# Construct the main strict hierarchy
+full_hier <- traffic_bottom |>
+  aggregate_key(
+    route / direction / lane_type / station,
+    flow = sum(flow)
+  )
+
+train_hier <- train_bottom |>
+  aggregate_key(
+    route / direction / lane_type / station,
+    flow = sum(flow)
+  )
+
+test_hier <- test_bottom |>
+  aggregate_key(
+    route / direction / lane_type / station,
+    flow = sum(flow)
+  )
+
+hierarchy_counts <- tibble(
+  total_series = full_hier |>
+    distinct(route, direction, lane_type, station) |>
+    nrow()
+)
+
+print(hierarchy_counts)
+
+```
+
+# 3. Exploratory analysis
+
+All exploratory analysis is conducted on the training period only. This keeps the descriptive analysis aligned with the forecasting workflow and avoids using the holdout period to guide modeling decisions.
+
+At the total level, I inspect the aggregate flow series for trend, seasonality, and volatility. I also examine the average hourly profile and average day-of-week profile to assess whether the traffic data exhibit strong recurring intraday and intraweek structure.
+
+```{r echo=FALSE}
+############################################################
+#  Exploratory analysis using training data only
+############################################################
+
+train_total <- train_hier |>
+  filter(
+    is_aggregated(route),
+    is_aggregated(direction),
+    is_aggregated(lane_type),
+    is_aggregated(station)
+  )
+
+test_total <- test_hier |>
+  filter(
+    is_aggregated(route),
+    is_aggregated(direction),
+    is_aggregated(lane_type),
+    is_aggregated(station)
+  )
+
+p_total <- bind_rows(train_total, test_total) |>
+  autoplot(flow) +
+  geom_vline(xintercept = cutoff_time, linetype = "dashed") +
+  labs(
+    title = "Top-level hourly traffic flow",
+    subtitle = "Dashed line marks the forecast origin",
+    x = "Time",
+    y = "Flow"
+  )
+
+hour_profile <- train_bottom |>
+  as_tibble() |>
+  mutate(hour = hour(timestamp)) |>
+  group_by(hour) |>
+  summarise(mean_flow = mean(flow), .groups = "drop")
+
+p_hour <- hour_profile |>
+  ggplot(aes(x = hour, y = mean_flow)) +
+  geom_line() +
+  labs(
+    title = "Average hourly profile (training period)",
+    x = "Hour of day",
+    y = "Mean flow"
+  )
+
+dow_profile <- train_bottom |>
+  as_tibble() |>
+  mutate(day = wday(timestamp, label = TRUE, week_start = 1)) |>
+  group_by(day) |>
+  summarise(mean_flow = mean(flow), .groups = "drop")
+
+p_dow <- dow_profile |>
+  ggplot(aes(x = day, y = mean_flow, group = 1)) +
+  geom_line() +
+  labs(
+    title = "Average day-of-week profile (training period)",
+    x = "Day of week",
+    y = "Mean flow"
+  )
+
+p_total / (p_hour | p_dow)
+```
+
+# 4. Base model specification
+
+## 4.1 Purpose of the base models
+
+The first stage of the forecasting workflow is to generate unconstrained base forecasts independently for every series in the hierarchy. These forecasts do not automatically satisfy the aggregation constraints of the hierarchy.
+
+## 4.2 Model classes
+
+I fit two univariate forecasting model classes to every series:
+
+1. ETS (Exponential Smoothing State Space Model),
+2. ARIMA (Autoregressive Integrated Moving Average).
+
+These models satisfy the assignment requirement of using at least two univariate model classes. They are also standard benchmark approaches in forecasting and provide a meaningful comparison between smoothing-based and autoregressive methods.
+
+## 4.3 Computational rationale
+
+The reduced-scale November subset makes it possible to estimate both ETS and ARIMA across the hierarchy without changing the core academic design of the project. The main computational compromise is therefore the data scope, not the rigor of the modeling framework.
+
+```{r echo=FALSE}
+############################################################
+# Base model specification
+############################################################
+
+base_models <- train_hier |>
+  model(
+    ets   = ETS(flow),
+    arima = ARIMA(flow)
+  )
+
+base_model_summary <- glance(base_models)
+print(base_model_summary)
+
+fc_base <- base_models |>
+  forecast(h = h_test)
+
+```
+
+
+# 5. Reconciliation theory and implementation
+
+## 5.1 General form
+
+Let \(\hat{\mathbf y}_h\) denote the vector of base forecasts at horizon \(h\). Reconciled forecasts are obtained by mapping those base forecasts into the coherent subspace:
+
+\[
+\tilde{\mathbf y}_h = \mathbf{S}\mathbf{G}\hat{\mathbf y}_h.
+\]
+
+Here, \(\mathbf{S}\) is the summing matrix defined by the hierarchy, and \(\mathbf{G}\) determines the reconciliation rule.
+
+## 5.2 Reconciliation methods used
+
+I compare five reconciliation strategies:
+
+1. bottom-up,
+2. top-down using forecast proportions,
+3. top-down using historical average proportions,
+4. MinT with shrinkage covariance,
+5. MinT with sample covariance.
+
+This exceeds the assignment requirement of comparing at least four reconciliation methods.
+
+## 5.3 Method interpretation
+
+Bottom-up relies on bottom-level forecasts and aggregates them upward. Top-down begins with top-level forecasts and allocates them downward. MinT methods combine information across all levels and choose reconciliation weights using forecast error covariance information.
+
+```{r echo=FALSE}
+############################################################
+# Reconciliation methods
+############################################################
+
+reconciled_models <- base_models |>
+  reconcile(
+    ets_bu            = bottom_up(ets),
+    ets_td_forecast   = top_down(ets, method = "forecast_proportions"),
+    ets_td_historical = top_down(ets, method = "average_proportions"),
+    ets_mint_shrink   = min_trace(ets, method = "mint_shrink"),
+    ets_mint_sample   = min_trace(ets, method = "mint_cov"),
+
+    arima_bu            = bottom_up(arima),
+    arima_td_forecast   = top_down(arima, method = "forecast_proportions"),
+    arima_td_historical = top_down(arima, method = "average_proportions"),
+    arima_mint_shrink   = min_trace(arima, method = "mint_shrink"),
+    arima_mint_sample   = min_trace(arima, method = "mint_cov")
+  )
+
+fc_reconciled <- reconciled_models |>
+  forecast(h = h_test)
+```
+
+
+# 6. Forecast evaluation
+
+## 6.1 Holdout design
+
+The holdout period consists of the final 168 hours of November 2024. All base and reconciled forecasts are evaluated on this common test window.
+
+## 6.2 Accuracy measures
+
+I use both scale-dependent and scale-free accuracy metrics:
+
+- RMSE,
+- MAE,
+- MASE,
+- RMSSE.
+
+This allows comparison across hierarchy levels as well as across methods.
+
+## 6.3 Why level-wise evaluation matters
+
+A reconciliation method may improve top-level performance while worsening bottom-level performance, or the reverse. Therefore, evaluation is reported by hierarchy level rather than only in aggregate.
+
+```{r echo=FALSE}
+############################################################
+#  Forecast evaluation
+############################################################
+
+acc_base <- fc_base |>
+  accuracy(test_hier, measures = accuracy_measures)
+
+acc_reconciled <- fc_reconciled |>
+  accuracy(test_hier, measures = accuracy_measures)
+
+acc_base_summary <- summarise_accuracy_by_level(acc_base) |>
+  mutate(forecast_family = "Base")
+
+acc_reconciled_summary <- summarise_accuracy_by_level(acc_reconciled) |>
+  mutate(forecast_family = "Reconciled")
+
+accuracy_by_level <- bind_rows(acc_base_summary, acc_reconciled_summary)
+print(accuracy_by_level)
+
+overall_base <- acc_base |>
+  group_by(.model) |>
+  summarise(
+    RMSE  = mean(RMSE, na.rm = TRUE),
+    MAE   = mean(MAE, na.rm = TRUE),
+    MASE  = mean(MASE, na.rm = TRUE),
+    RMSSE = mean(RMSSE, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(forecast_family = "Base")
+
+overall_reconciled <- acc_reconciled |>
+  group_by(.model) |>
+  summarise(
+    RMSE  = mean(RMSE, na.rm = TRUE),
+    MAE   = mean(MAE, na.rm = TRUE),
+    MASE  = mean(MASE, na.rm = TRUE),
+    RMSSE = mean(RMSSE, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(forecast_family = "Reconciled")
+
+overall_accuracy <- bind_rows(overall_base, overall_reconciled) |>
+  arrange(RMSSE)
+
+print(overall_accuracy)
+
+best_reconciled_by_level <- acc_reconciled_summary |>
+  group_by(hierarchy_level) |>
+  slice_min(order_by = RMSSE, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+print(best_reconciled_by_level)
+```
+
+
+# 7. Results visualisation
+
+To complement the accuracy tables, I visualise forecast performance in two ways:
+
+1. a top-level forecast plot showing actual values and reconciled forecasts,
+2. a bar chart comparing mean RMSSE across methods by hierarchy level.
+
+These plots help identify whether a method performs consistently across levels or only at selected aggregation levels.
+
+```{r echo=FALSE}
+############################################################
+#  Results plots
+############################################################
+
+# Top-level forecast plot
+fc_total <- fc_reconciled |>
+  filter(
+    is_aggregated(route),
+    is_aggregated(direction),
+    is_aggregated(lane_type),
+    is_aggregated(station)
+  )
+
+actual_total <- bind_rows(train_hier, test_hier) |>
+  filter(
+    is_aggregated(route),
+    is_aggregated(direction),
+    is_aggregated(lane_type),
+    is_aggregated(station)
+  )
+
+autoplot(actual_total, flow) +
+  autolayer(fc_total, level = NULL) +
+  geom_vline(xintercept = cutoff_time, linetype = "dashed") +
+  labs(
+    title = "Top-level actuals and reconciled forecasts",
+    x = "Time",
+    y = "Flow"
+  )
+
+# RMSSE comparison by hierarchy level
+acc_reconciled_summary |>
+  ggplot(aes(x = .model, y = RMSSE)) +
+  geom_col() +
+  facet_wrap(vars(hierarchy_level), scales = "free_y") +
+  coord_flip() +
+  labs(
+    title = "Reconciled forecast performance by hierarchy level",
+    x = "Model",
+    y = "Mean RMSSE"
+  )
+```
+
+
+# 8. Empirical evaluation results
+
+## 8.1 Base forecast results
+
+Across the unreconciled base forecasts, the [ARIMA / ETS] model achieved the strongest overall holdout performance according to [RMSSE / MASE / RMSE]. The average [chosen metric] was [INSERT VALUE] for [MODEL], compared with [INSERT VALUE] for [OTHER MODEL].
+
+This indicates that [INSERT INTERPRETATION].
+
+## 8.2 Reconciled forecast results
+
+Among the reconciled methods, [INSERT BEST METHOD] produced the strongest overall performance. Its average RMSSE was [INSERT VALUE], compared with [INSERT VALUES] for bottom-up, top-down forecast proportions, top-down historical proportions, MinT shrinkage, and MinT sample covariance.
+
+This suggests that [INSERT INTERPRETATION].
+
+## 8.3 Performance by hierarchy level
+
+The level-wise results reveal how the methods trade off aggregate and local accuracy.
+
+### Total level
+At the total level, [INSERT METHOD] performed best, with [INSERT METRIC VALUE]. This suggests that [INSERT INTERPRETATION].
+
+### Route level
+At the route level, [INSERT FINDING].
+
+### Route-Direction level
+At the route-direction level, [INSERT FINDING].
+
+### Route-Direction-LaneType level
+At the route-direction-lane-type level, [INSERT FINDING].
+
+### Station level
+At the bottom station level, [INSERT FINDING]. This is especially important because station-level accuracy determines whether the method is useful for granular operational decisions.
+
+## 8.4 Base versus reconciled forecasts
+
+Comparing unreconciled and reconciled forecasts shows that reconciliation [improved / did not improve] forecast performance overall. The main gain came from [INSERT GAIN], while the main limitation was [INSERT LIMITATION].
+
+These findings show that coherence is not merely an accounting constraint. The reconciliation rule can materially influence predictive performance.
+
+# 9. Theoretical discussion
+
+This section addresses three theoretical questions:
+1. Under what conditions is MinT equivalent to bottom-up?
+2. How does covariance misspecification affect coherence and accuracy?
+3. When can reconciliation worsen bottom-level accuracy?
+
+## 9.1 When is MinT equivalent to bottom-up?
+
+Let \(\hat{\mathbf y}_h\) denote the vector of base forecasts and \(\mathbf S\) the summing matrix. MinT can be written as
+
+\[
+\tilde{\mathbf y}_h
+=
+\mathbf S
+\left(\mathbf S^\top \mathbf W_h^{-1}\mathbf S\right)^{-1}
+\mathbf S^\top \mathbf W_h^{-1}
+\hat{\mathbf y}_h,
+\]
+
+where \(\mathbf W_h\) is the covariance matrix of base forecast errors.
+
+Bottom-up is a special case in which only the bottom-level forecasts are used directly and all upper-level forecasts are obtained by aggregation. Therefore, MinT coincides with bottom-up only under special covariance structures where the optimal combination rule places no effective value on non-bottom-level base forecasts.
+
+## 9.2 Effect of covariance misspecification
+
+Coherence is imposed algebraically, so covariance misspecification does not destroy coherence. However, it can reduce accuracy. MinT is only optimal relative to the covariance matrix used to construct it. If that covariance matrix is estimated poorly, the resulting reconciliation weights may be inefficient or unstable.
+
+This is one reason shrinkage-based covariance estimation often outperforms raw sample covariance estimation in finite samples.
+
+## 9.3 When can reconciliation worsen bottom-level accuracy?
+
+Reconciliation can worsen bottom-level accuracy when the local station forecasts are already strong and the reconciliation rule pulls them toward less relevant aggregate information. This is especially likely when:
+
+1. the bottom-level models already fit local dynamics well,
+2. the covariance matrix is poorly estimated,
+3. top-down allocation oversmooths heterogeneous station-level behavior.
+
+## 9.4 Aggregation and variance reduction
+
+Aggregation often reduces idiosyncratic noise because local fluctuations partially cancel when summed. This can make upper-level series easier to forecast. However, aggregation also removes local detail. Reconciliation is valuable because it aims to combine the stability of aggregate information with the specificity of bottom-level forecasts.
+
+# 10. Sensitivity and robustness analysis
+
+## 10.1 Motivation
+
+The assignment requires at least one robustness exercise. I use forecast horizon sensitivity as the main robustness analysis.
+
+## 10.2 Design
+
+I repeat the full reconciliation workflow for alternative test horizons of:
+
+- 24 hours,
+- 72 hours,
+- 168 hours.
+
+This tests whether the ranking of reconciliation methods remains stable as the forecasting horizon increases.
+
+## 10.3 Interpretation
+
+If the same reconciliation method remains strong across all three horizons, then the main findings are more reliable. If method rankings change materially across horizons, then the preferred reconciliation method is horizon-dependent.
+
+```{r echo=FALSE}
+############################################################
+#  Sensitivity and robustness analysis
+############################################################
+
+run_horizon_experiment <- function(bottom_data, horizon_hours) {
+
+  cutoff_h <- max(bottom_data$timestamp) - hours(horizon_hours)
+
+  train_h <- bottom_data |>
+    filter(timestamp <= cutoff_h)
+
+  test_h <- bottom_data |>
+    filter(timestamp > cutoff_h)
+
+  train_hier_h <- train_h |>
+    aggregate_key(
+      route / direction / lane_type / station,
+      flow = sum(flow)
+    )
+
+  test_hier_h <- test_h |>
+    aggregate_key(
+      route / direction / lane_type / station,
+      flow = sum(flow)
+    )
+
+  base_h <- train_hier_h |>
+    model(
+      ets   = ETS(flow),
+      arima = ARIMA(flow)
+    )
+
+  reconciled_h <- base_h |>
+    reconcile(
+      ets_bu            = bottom_up(ets),
+      ets_td_forecast   = top_down(ets, method = "forecast_proportions"),
+      ets_td_historical = top_down(ets, method = "average_proportions"),
+      ets_mint_shrink   = min_trace(ets, method = "mint_shrink"),
+      ets_mint_sample   = min_trace(ets, method = "mint_cov"),
+
+      arima_bu            = bottom_up(arima),
+      arima_td_forecast   = top_down(arima, method = "forecast_proportions"),
+      arima_td_historical = top_down(arima, method = "average_proportions"),
+      arima_mint_shrink   = min_trace(arima, method = "mint_shrink"),
+      arima_mint_sample   = min_trace(arima, method = "mint_cov")
+    )
+
+  fc_h <- reconciled_h |>
+    forecast(h = horizon_hours)
+
+  fc_h |>
+    accuracy(test_hier_h, measures = accuracy_measures) |>
+    add_hierarchy_level() |>
+    group_by(.model, hierarchy_level) |>
+    summarise(
+      RMSE  = mean(RMSE, na.rm = TRUE),
+      MAE   = mean(MAE, na.rm = TRUE),
+      MASE  = mean(MASE, na.rm = TRUE),
+      RMSSE = mean(RMSSE, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    mutate(horizon_hours = horizon_hours)
+}
+
+robust_h24  <- run_horizon_experiment(traffic_bottom, 24)
+robust_h72  <- run_horizon_experiment(traffic_bottom, 72)
+robust_h168 <- run_horizon_experiment(traffic_bottom, 168)
+
+robust_horizons <- bind_rows(robust_h24, robust_h72, robust_h168)
+print(robust_horizons)
+```
+
+# 11. Robustness results
+
+## 11.1 Horizon sensitivity
+
+The horizon sensitivity analysis showed that the ranking of reconciliation methods [did / did not] remain stable across 24-, 72-, and 168-hour forecast horizons. In particular, [INSERT METHOD] was strongest at [INSERT HORIZON], while [INSERT METHOD] became relatively stronger/weaker as the horizon increased.
+
+This suggests that [INSERT INTERPRETATION].
+
+## 11.2 Implications
+
+If the same method remains strong across all horizons, then it is a robust reconciliation choice for this traffic hierarchy. If the rankings change substantially, then the preferred method depends on whether the forecasting task is short-term or medium-term.
+
+# 12. Appendix: grouped cross-classified extension
+
+The dataset also supports a grouped or cross-classified representation because `Route`, `Direction`, and `Lane Type` can be treated as crossed attributes rather than a single strict tree. This is useful if an explicit grouped-structure appendix is required.
+
+Because top-down methods are designed for hierarchical trees, this appendix focuses on MinT reconciliation in the grouped representation.
+
+```{r echo=FALSE}
+############################################################
+# Appendix: grouped cross-classified extension
+############################################################
+
+# Optional: run this only if you want an explicit grouped-structure appendix
+
+train_grouped <- train_bottom |>
+  aggregate_key(
+    (route * direction * lane_type) / station,
+    flow = sum(flow)
+  )
+
+test_grouped <- test_bottom |>
+  aggregate_key(
+    (route * direction * lane_type) / station,
+    flow = sum(flow)
+  )
+
+grouped_models <- train_grouped |>
+  model(
+    ets   = ETS(flow),
+    arima = ARIMA(flow)
+  )
+
+grouped_reconciled <- grouped_models |>
+  reconcile(
+    ets_mint_shrink   = min_trace(ets, method = "mint_shrink"),
+    ets_mint_sample   = min_trace(ets, method = "mint_cov"),
+    arima_mint_shrink = min_trace(arima, method = "mint_shrink"),
+    arima_mint_sample = min_trace(arima, method = "mint_cov")
+  )
+
+fc_grouped <- grouped_reconciled |>
+  forecast(h = h_test)
+
+acc_grouped <- fc_grouped |>
+  accuracy(test_grouped, measures = accuracy_measures) |>
+  group_by(.model) |>
+  summarise(
+    RMSE  = mean(RMSE, na.rm = TRUE),
+    MAE   = mean(MAE, na.rm = TRUE),
+    MASE  = mean(MASE, na.rm = TRUE),
+    RMSSE = mean(RMSSE, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(RMSSE)
+
+print(acc_grouped)
+```
+
+
+# 13. Conclusion
+
+This project developed a coherent hierarchical forecasting system for hourly traffic flow using a reduced-scale but structurally rich subset of the original dataset. The analysis focused on November 2024 and retained a deterministic subset of complete stations so that the forecasting workflow remained computationally feasible without sacrificing the essential features of the assignment.
+
+The project demonstrated that hierarchical forecasting can be implemented rigorously even under practical runtime constraints. By preserving more than 100 bottom-level series and more than 100 observations per series, the reduced sample still supports meaningful comparison of bottom-up, top-down, and MinT reconciliation methods.
+
+A major strength of this reduced-scale design is that it eliminates the need for imputation. Because the selected stations are fully observed throughout the month, the workflow avoids one of the most common sources of time-series leakage.
+
+The empirical analysis shows that [INSERT BEST METHOD] provided the strongest overall balance between coherence and accuracy. More broadly, the results show that reconciliation can materially affect forecast performance and that its impact varies across hierarchy levels and forecast horizons.
+
+A limitation of the reduced design is that it uses only one month of data, so the study focuses on short-run traffic structure rather than longer-term seasonal variation. Even so, the project remains a strong demonstration of hierarchical forecasting methodology in R.
