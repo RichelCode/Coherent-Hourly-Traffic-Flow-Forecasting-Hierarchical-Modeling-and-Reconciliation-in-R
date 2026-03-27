@@ -592,3 +592,428 @@ p_dow <- dow_profile |>
 p_total / (p_hour | p_dow)
 ```
 
+
+# 5. Base model specification
+
+## 5.1 Purpose of the base models
+
+The first modeling stage produces unconstrained base forecasts independently for every series in the hierarchy. These forecasts are not expected to be coherent. Reconciliation is applied afterward.
+
+## 5.2 Chosen model classes
+
+I fit two univariate model classes to each series:
+
+1. ETS (Exponential Smoothing State Space Model),
+2. ARIMA (Autoregressive Integrated Moving Average).
+
+
+## 5.3 Why these models are appropriate
+
+Traffic flow data typically exhibit serial dependence, recurrent patterns, and changing local level. ETS is useful because it captures evolving level, trend, and seasonal structure in a state space framework. ARIMA is useful because it models autocorrelation and differencing-based dynamics explicitly. Together, these two model classes provide a credible and interpretable base-model comparison.
+
+```{r echo=FALSE}
+############################################################
+#  Base model specification
+############################################################
+
+base_models <- fit_base_suite(train_hier)
+
+# Compact model diagnostics
+base_model_glance <- glance(base_models)
+print(base_model_glance)
+
+# Base forecasts over the holdout horizon
+fc_base <- base_models |>
+  forecast(h = h_main)
+```
+
+
+
+# 6. Reconciliation theory and implementation
+
+## 6.1 General reconciliation framework
+
+Let \(\hat{\mathbf y}_h\) denote the vector of base forecasts at horizon \(h\). These forecasts are generally incoherent. Reconciled forecasts are constructed as
+
+\[
+\tilde{\mathbf y}_h = \mathbf{S}\mathbf{G}\hat{\mathbf y}_h,
+\]
+
+where \(\mathbf{S}\) is the summing matrix and \(\mathbf{G}\) maps the base forecasts into a coherent representation.
+
+## 6.2 Reconciliation methods considered
+
+I compare the following reconciliation strategies:
+
+1. **Bottom-up**  
+   Bottom-level forecasts are generated first and then aggregated upward.
+
+2. **Top-down using forecast proportions**  
+   The top-level forecast is allocated downward using proportions implied by the lower-level base forecasts.
+
+3. **Top-down using historical proportions**  
+   The top-level forecast is allocated downward using historical average shares.
+
+4. **MinT with shrinkage covariance**  
+   The reconciliation weights are chosen to minimize forecast error variance using a shrinkage estimate of the forecast error covariance matrix.
+
+5. **MinT with sample covariance**  
+   The reconciliation weights are based on the sample covariance matrix of residuals.
+
+
+```{r echo=FALSE}
+############################################################
+# Reconciliation theory and implementation
+############################################################
+
+reconciled_models <- fit_reconciliation_suite(base_models)
+
+# Reconciled forecasts over the holdout horizon
+fc_reconciled <- reconciled_models |>
+  forecast(h = h_main)
+
+```
+
+
+# 7. Forecast evaluation
+
+## 7.1 Evaluation design
+
+The final 14 days of the sample are used as a holdout period. Forecast accuracy is evaluated using both scale-dependent and scale-free measures:
+
+- RMSE,
+- MAE,
+- MASE,
+- RMSSE.
+
+I compare unreconciled base forecasts with reconciled forecasts and report performance both overall and by hierarchy level.
+
+## 7.2 Why level-wise evaluation matters
+
+A reconciliation method can improve aggregate accuracy while worsening bottom-level performance, or vice versa. Therefore, results must be assessed not only overall but also at the total, route, intermediate, and station levels.
+
+```{r echo=FALSE}
+############################################################
+#  Forecast evaluation
+############################################################
+
+# Base forecast accuracy
+acc_base <- fc_base |>
+  accuracy(test_hier, measures = accuracy_measures)
+
+# Reconciled forecast accuracy
+acc_reconciled <- fc_reconciled |>
+  accuracy(test_hier, measures = accuracy_measures)
+
+# Summaries by level
+acc_base_summary <- summarise_accuracy_by_level(acc_base) |>
+  mutate(forecast_family = "Base")
+
+acc_reconciled_summary <- summarise_accuracy_by_level(acc_reconciled) |>
+  mutate(forecast_family = "Reconciled")
+
+accuracy_by_level <- bind_rows(acc_base_summary, acc_reconciled_summary)
+
+print(accuracy_by_level)
+
+# Overall summaries across all series
+overall_base <- acc_base |>
+  group_by(.model) |>
+  summarise(
+    RMSE  = mean(RMSE, na.rm = TRUE),
+    MAE   = mean(MAE, na.rm = TRUE),
+    MASE  = mean(MASE, na.rm = TRUE),
+    RMSSE = mean(RMSSE, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(forecast_family = "Base")
+
+overall_reconciled <- acc_reconciled |>
+  group_by(.model) |>
+  summarise(
+    RMSE  = mean(RMSE, na.rm = TRUE),
+    MAE   = mean(MAE, na.rm = TRUE),
+    MASE  = mean(MASE, na.rm = TRUE),
+    RMSSE = mean(RMSSE, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(forecast_family = "Reconciled")
+
+overall_accuracy <- bind_rows(overall_base, overall_reconciled) |>
+  arrange(RMSSE)
+
+print(overall_accuracy)
+
+# Best reconciled model by hierarchy level
+best_reconciled_by_level <- acc_reconciled_summary |>
+  group_by(hierarchy_level) |>
+  slice_min(order_by = RMSSE, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+print(best_reconciled_by_level)
+```
+
+
+# 8. Empirical evaluation results
+
+## 8.1 Base forecast results
+
+Across the unreconciled base forecasts, the [ARIMA / ETS] model achieved the strongest overall holdout performance according to [RMSSE / MASE / RMSE]. The average [chosen metric] was [INSERT VALUE] for [MODEL], compared with [INSERT VALUE] for [OTHER MODEL].
+
+This suggests that [INSERT INTERPRETATION, for example: “the autocorrelation structure captured by ARIMA provided a modest advantage over the smoothing-based specification”].
+
+## 8.2 Reconciled forecast results
+
+Among the reconciled methods, [INSERT BEST METHOD] delivered the strongest overall performance. Its average RMSSE was [INSERT VALUE], compared with [INSERT VALUES] for the other reconciliation methods.
+
+These results indicate that [INSERT INTERPRETATION]. In particular, [INSERT BEST METHOD] appears to provide the best balance between aggregate coherence and predictive accuracy.
+
+## 8.3 Performance by hierarchy level
+
+The level-wise evaluation reveals how the methods trade off local and aggregate accuracy.
+
+### Total level
+At the total level, [INSERT METHOD] achieved the best performance, with [INSERT METRIC VALUE]. This indicates that [INSERT INTERPRETATION].
+
+### Route level
+At the route level, [INSERT FINDING].
+
+### Route-Direction level
+At the route-direction level, [INSERT FINDING].
+
+### Route-Direction-LaneType level
+At the route-direction-lane-type level, [INSERT FINDING].
+
+### Station level
+At the station level, [INSERT FINDING]. This level is operationally important because station-level accuracy determines the usefulness of the forecasts for local traffic management.
+
+## 8.4 Base versus reconciled forecasts
+
+Comparing unreconciled and reconciled forecasts shows that reconciliation [improved / did not improve] accuracy overall. The main gain came from [INSERT MAIN GAIN], while the main limitation was [INSERT MAIN LIMITATION].
+
+These results show that coherence is not just an accounting constraint. The choice of reconciliation method can materially affect predictive performance.
+
+```{r echo=FALSE}
+############################################################
+#  Tables and figures for the results section
+############################################################
+
+# Plot RMSSE by method and hierarchy level
+acc_reconciled_summary |>
+  ggplot(aes(x = .model, y = RMSSE)) +
+  geom_col() +
+  facet_wrap(vars(hierarchy_level), scales = "free_y") +
+  coord_flip() +
+  labs(
+    title = "Reconciled forecast performance by hierarchy level",
+    x = "Model",
+    y = "Mean RMSSE"
+  )
+
+# Top-level forecast plot
+fc_total <- fc_reconciled |>
+  filter(
+    is_aggregated(route),
+    is_aggregated(direction),
+    is_aggregated(lane_type),
+    is_aggregated(station)
+  )
+
+actual_total <- bind_rows(train_hier, test_hier) |>
+  filter(
+    is_aggregated(route),
+    is_aggregated(direction),
+    is_aggregated(lane_type),
+    is_aggregated(station)
+  )
+
+autoplot(actual_total, flow) +
+  autolayer(fc_total, level = NULL) +
+  geom_vline(xintercept = cutoff_time, linetype = "dashed") +
+  labs(
+    title = "Top-level actuals and reconciled forecasts",
+    x = "Time",
+    y = "Flow"
+  )
+```
+
+# 9. Theoretical investigation
+
+This section addresses three theoretical questions:  
+(1) Under what conditions is MinT equivalent to bottom-up?  
+(2) How does covariance misspecification affect coherence and accuracy?  
+(3) When can reconciliation worsen bottom-level accuracy?
+
+## 9.1 When is MinT equivalent to bottom-up?
+
+Let \(\hat{\mathbf y}_h\) denote the vector of base forecasts and let \(\mathbf{S}\) denote the summing matrix. MinT reconciles forecasts according to
+
+\[
+\tilde{\mathbf y}_h
+=
+\mathbf{S}
+\left(\mathbf{S}^\top \mathbf{W}_h^{-1}\mathbf{S}\right)^{-1}
+\mathbf{S}^\top \mathbf{W}_h^{-1}
+\hat{\mathbf y}_h,
+\]
+
+where \(\mathbf{W}_h\) is the covariance matrix of base forecast errors.
+
+Bottom-up is a special case in which coherent forecasts are formed solely by aggregating the bottom-level forecasts upward. Therefore, MinT becomes equivalent to bottom-up only in special situations where the optimal weighting scheme places no effective value on non-bottom-level base forecasts. Intuitively, this requires that the aggregate-level forecasts add no information beyond the bottom-level forecasts.
+
+## 9.2 Effect of covariance misspecification
+
+Coherence is imposed algebraically by the reconciliation mapping, so covariance misspecification does not destroy coherence. However, it can reduce accuracy. MinT is optimal only relative to the covariance matrix used in its construction. If that covariance matrix is poorly estimated, the resulting weights may be inefficient or unstable. This is especially relevant in large hierarchies where the number of related series is large relative to the available training history.
+
+This explains why shrinkage-based covariance estimation often performs better in practice than raw sample covariance estimation.
+
+## 9.3 When can reconciliation worsen bottom-level accuracy?
+
+Reconciliation can worsen bottom-level accuracy when the station-level base forecasts are already strong and the reconciliation step pulls them toward noisier or less relevant aggregate information. This can happen when:
+
+1. the bottom-level models already fit the local dynamics well,
+2. the covariance matrix used in MinT is poorly estimated,
+3. a top-down allocation rule imposes overly smooth aggregate information on heterogeneous bottom-level series.
+
+Therefore, reconciliation should always be evaluated by hierarchy level rather than only at the total level.
+
+## 9.4 Aggregation and variance reduction
+
+Aggregation often reduces noise because idiosyncratic local fluctuations partially cancel out when series are summed. This makes higher-level series easier to forecast in many cases. However, aggregation also discards local structure. Reconciliation is valuable because it attempts to combine the relative stability of upper-level information with the specificity of bottom-level forecasts.
+
+# 10. Sensitivity and robustness analysis
+
+## 10.1 Motivation
+
+Reconciliation performance can depend on both the forecast horizon and the way the hierarchy is defined. To assess the robustness of the main findings, I perform two additional experiments:
+
+1. vary the forecast horizon,
+2. change the aggregation structure.
+
+## 10.2 Horizon robustness
+
+I repeat the full forecasting and reconciliation workflow for alternative forecast horizons of 24, 72, and 168 hours. This shows whether the ranking of reconciliation methods changes as the forecasting problem becomes more difficult.
+
+## 10.3 Structural robustness
+
+In the main analysis, I use a strict hierarchy. As an additional robustness check, I also construct an alternative grouped specification by crossing `Route`, `Direction`, and `Lane Type`. This tests whether the main empirical conclusions depend heavily on the exact hierarchy design.
+
+```{r echo=FALSE}
+############################################################
+#  Sensitivity and robustness analysis
+############################################################
+
+# ---------------------------
+#  Horizon robustness
+# ---------------------------
+run_horizon_experiment <- function(panel_data, horizon_hours) {
+
+  cutoff_h <- max(panel_data$timestamp) - hours(horizon_hours)
+
+  split_h <- prepare_hier_split(
+    panel_data  = panel_data,
+    cutoff_time = cutoff_h
+  )
+
+  h_h <- split_h$test_hier |>
+    distinct(timestamp) |>
+    nrow()
+
+  base_h <- fit_base_suite(split_h$train_hier)
+  reconciled_h <- fit_reconciliation_suite(base_h)
+
+  fc_h <- reconciled_h |>
+    forecast(h = h_h)
+
+  fc_h |>
+    accuracy(split_h$test_hier, measures = accuracy_measures) |>
+    add_hierarchy_level() |>
+    group_by(.model, hierarchy_level) |>
+    summarise(
+      RMSE  = mean(RMSE, na.rm = TRUE),
+      MAE   = mean(MAE, na.rm = TRUE),
+      MASE  = mean(MASE, na.rm = TRUE),
+      RMSSE = mean(RMSSE, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    mutate(horizon_hours = horizon_hours)
+}
+
+robust_h24  <- run_horizon_experiment(traffic_study, 24)
+robust_h72  <- run_horizon_experiment(traffic_study, 72)
+robust_h168 <- run_horizon_experiment(traffic_study, 168)
+
+robust_horizons <- bind_rows(robust_h24, robust_h72, robust_h168)
+print(robust_horizons)
+
+# ---------------------------
+# Alternative grouped structure
+# ---------------------------
+# Uses the SAME leakage-safe main split:
+# - train_bottom was imputed from training data only
+# - test_bottom contains untouched observed actuals
+
+train_grouped <- train_bottom |>
+  aggregate_key(
+    (route * direction * lane_type) / station,
+    flow = sum(flow)
+  )
+
+test_grouped <- test_bottom |>
+  aggregate_key(
+    (route * direction * lane_type) / station,
+    flow = sum(flow)
+  )
+
+h_grouped <- test_grouped |>
+  distinct(timestamp) |>
+  nrow()
+
+base_grouped <- fit_base_suite(train_grouped)
+reconciled_grouped <- fit_reconciliation_suite(base_grouped)
+
+fc_grouped <- reconciled_grouped |>
+  forecast(h = h_grouped)
+
+grouped_accuracy <- fc_grouped |>
+  accuracy(test_grouped, measures = accuracy_measures) |>
+  group_by(.model) |>
+  summarise(
+    RMSE  = mean(RMSE, na.rm = TRUE),
+    MAE   = mean(MAE, na.rm = TRUE),
+    MASE  = mean(MASE, na.rm = TRUE),
+    RMSSE = mean(RMSSE, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(RMSSE)
+
+print(grouped_accuracy)
+```
+
+
+# 11. Robustness results
+
+## 11.1 Horizon sensitivity
+
+The horizon robustness analysis shows that the performance ranking of reconciliation methods [did / did not] remain stable across 24-, 72-, and 168-hour forecast horizons. In particular, [INSERT METHOD] performed best at [INSERT HORIZON], while [INSERT METHOD] became relatively stronger/weaker as the horizon increased.
+
+This suggests that [INSERT INTERPRETATION].
+
+## 11.2 Structural sensitivity
+
+When the strict hierarchy was replaced with an alternative grouped representation, the ranking of methods [remained broadly similar / changed materially]. This indicates that the main conclusions are [structurally robust / sensitive to hierarchy definition].
+
+## 11.3 Implications
+
+Overall, the robustness analysis suggests that [INSERT FINAL ROBUSTNESS TAKEAWAY]. This strengthens the credibility of the preferred reconciliation method for practical use.
+
+
+# 12. Conclusion
+
+This project developed a coherent hierarchical forecasting system for hourly traffic flow data using the `fpp3` framework in R. The analysis combined station-level series into a multilevel additive hierarchy and compared unreconciled base forecasts with several reconciliation strategies, including bottom-up, top-down, and MinT-based methods.
+
+The study was designed to be both methodologically rigorous and practically relevant. In particular, the workflow avoided data leakage by splitting the sample before any training imputation, imputing only the training data, and reserving the test set for untouched out-of-sample evaluation.
+
+The empirical results show that [INSERT BEST METHOD] provided the best overall balance between coherence and accuracy. More broadly, the analysis demonstrates that reconciliation is not merely a bookkeeping adjustment. The choice of reconciliation method can materially influence forecasting performance, and its effect depends on the hierarchy level, covariance assumptions, and forecast horizon.
+
+Overall, this project shows that hierarchical forecasting is both theoretically rich and operationally important. In a traffic setting, coherent forecasts can improve reporting consistency, network planning, and decision-making across multiple levels of aggregation.
